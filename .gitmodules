@@ -1,4 +1,15 @@
-[submodule "MobileGlues"]
-	path = MobileGlues
-	url = https://github.com/MobileGL-Dev/MobileGlues
-	branch = plugin
+[submodule "MobileGlues/MobileGlues-cpp/3rdparty/perfetto"]
+	path = MobileGlues/MobileGlues-cpp/3rdparty/perfetto
+	url = https://android.googlesource.com/platform/external/perfetto
+[submodule "MobileGlues/MobileGlues-cpp/3rdparty/xxhash"]
+	path = MobileGlues/MobileGlues-cpp/3rdparty/xxhash
+	url = https://github.com/stbrumme/xxhash.git
+[submodule "MobileGlues/MobileGlues-cpp/3rdparty/glslang"]
+	path = MobileGlues/MobileGlues-cpp/3rdparty/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+[submodule "MobileGlues/MobileGlues-cpp/3rdparty/SPIRV-Cross"]
+	path = MobileGlues/MobileGlues-cpp/3rdparty/SPIRV-Cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git
+[submodule "MobileGlues/MobileGlues-cpp/include/ska"]
+	path = MobileGlues/MobileGlues-cpp/include/ska
+	url = https://github.com/MobileGL-Dev/flat_hash_map.git
