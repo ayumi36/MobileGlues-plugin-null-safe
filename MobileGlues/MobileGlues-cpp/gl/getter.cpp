@@ -29,6 +29,21 @@ Version GLVersion;
 namespace {
 // See mg_set_gl_error in gl/mg.h for why this exists and why it is per thread.
 thread_local GLenum g_frontend_error = GL_NO_ERROR;
+
+// Filled while init_target_egl's ES3 probe context is current. Unlike a guessed
+// desktop default, this is a value returned by the active GLES implementation.
+// It is used only when the same live query is unavailable because that backend
+// has no current context (or returns an impossible zero without an error).
+GLint g_probe_uniform_buffer_offset_alignment = 0;
+
+const char* activeBackendPath();
+
+struct BackendIntegerQuery {
+    GLint value = -1; // A valid uniform-buffer alignment is strictly positive.
+    GLenum error = GL_NO_ERROR;
+    bool called = false;
+    bool error_available = false;
+};
 } // namespace
 
 void mg_set_gl_error(GLenum error) {
@@ -39,6 +54,61 @@ void mg_set_gl_error(GLenum error) {
     g_frontend_error = error;
     LOG_D("MobileGlues raised %s", glEnumToString(error))
 }
+
+namespace {
+
+BackendIntegerQuery queryBackendInteger(GLenum pname, const char* phase, bool preserve_errors) {
+    BackendIntegerQuery result;
+    if (GLES.glGetIntegerv == nullptr) {
+        LOG_W_FORCE("%s: GLES.glGetIntegerv entry point is unavailable; backend=%s", phase, activeBackendPath())
+        return result;
+    }
+
+    // Separate errors left by earlier translated calls from the error produced by
+    // this query. MobileGlues' public glGetError already deliberately consumes and
+    // logs backend errors; preserve the first old one in its frontend latch so this
+    // diagnostic query does not silently erase information.
+    if (GLES.glGetError != nullptr) {
+        result.error_available = true;
+        GLenum first_preexisting = GL_NO_ERROR;
+        for (int i = 0; i < 16; ++i) {
+            const GLenum error = GLES.glGetError();
+            if (error == GL_NO_ERROR) break;
+            if (first_preexisting == GL_NO_ERROR) first_preexisting = error;
+            LOG_W_FORCE("%s: pre-existing backend GL error %s (0x%04x) before querying 0x%04x; backend=%s", phase,
+                        glEnumToString(error), static_cast<unsigned int>(error), static_cast<unsigned int>(pname),
+                        activeBackendPath())
+        }
+        if (preserve_errors && first_preexisting != GL_NO_ERROR) mg_set_gl_error(first_preexisting);
+    }
+
+    result.called = true;
+    GLES.glGetIntegerv(pname, &result.value);
+
+    if (GLES.glGetError != nullptr) {
+        for (int i = 0; i < 16; ++i) {
+            const GLenum error = GLES.glGetError();
+            if (error == GL_NO_ERROR) break;
+            if (result.error == GL_NO_ERROR) result.error = error;
+            LOG_W_FORCE("%s: backend GL error %s (0x%04x) after querying 0x%04x; returned value=%d; backend=%s", phase,
+                        glEnumToString(error), static_cast<unsigned int>(error), static_cast<unsigned int>(pname),
+                        result.value, activeBackendPath())
+        }
+        if (preserve_errors && result.error != GL_NO_ERROR) mg_set_gl_error(result.error);
+    }
+    return result;
+}
+
+bool isValidBackendInteger(const BackendIntegerQuery& query) {
+    return query.called && query.value > 0 && (!query.error_available || query.error == GL_NO_ERROR);
+}
+
+const char* trackedContextDescription() {
+    if (g_current_ctx == nullptr) return "untracked/none";
+    return g_current_ctx->client_type == EGL_OPENGL_API ? "tracked desktop frontend" : "tracked GLES frontend";
+}
+
+} // namespace
 
 void glGetIntegerv(GLenum pname, GLint* params) {
     LOG()
@@ -122,6 +192,49 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         // reduced to 0 -- makes a loader believe it has a debug or robust context
         // that does not behave like one.
         (*params) = g_current_ctx ? g_current_ctx->context_flags : 0;
+        break;
+    }
+    case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: {
+        // RenderPearl obtains DeviceLimits.minUniformOffsetAlignment through
+        // GL33C.glGetInteger, whose zeroed LWJGL scratch buffer used to remain 0
+        // whenever the backend rejected this generic pass-through query. Query a
+        // sentinel instead, inspect the real backend error in every build, and use
+        // only the value captured from our ES3 bootstrap context as recovery.
+        const BackendIntegerQuery query =
+            queryBackendInteger(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT,
+                                "glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT)", true);
+        if (isValidBackendInteger(query)) {
+            *params = query.value;
+            LOG_I("GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: value=%d, error=GL_NO_ERROR, backend=%s, context=%s",
+                  *params, activeBackendPath(), trackedContextDescription())
+            break;
+        }
+
+        // GL_INVALID_ENUM is an actual unsupported-capability result. Do not turn
+        // it into support by borrowing a value from a different context. A missing
+        // context (GL_INVALID_OPERATION), a missing dispatch call, or an impossible
+        // zero with GL_NO_ERROR may reuse the same backend's successful ES3 probe.
+        const bool unsupported = query.error_available && query.error == GL_INVALID_ENUM;
+        if (!unsupported && g_probe_uniform_buffer_offset_alignment > 0) {
+            *params = g_probe_uniform_buffer_offset_alignment;
+            LOG_W_FORCE("GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: live value=%d, error=%s (0x%04x), backend=%s, "
+                        "context=%s; using real bootstrap-probe value=%d",
+                        query.value,
+                        query.error_available ? glEnumToString(query.error) : "<glGetError unavailable>",
+                        static_cast<unsigned int>(query.error), activeBackendPath(), trackedContextDescription(),
+                        *params)
+        } else {
+            // Deterministic failure is preferable to leaving the caller's storage
+            // untouched. Zero is not presented as a capability: the log explicitly
+            // records that the required ES3 limit could not be obtained.
+            *params = 0;
+            LOG_W_FORCE("GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: FAILED, live value=%d, error=%s (0x%04x), backend=%s, "
+                        "context=%s, bootstrap value=%d; no capability fallback was fabricated",
+                        query.value,
+                        query.error_available ? glEnumToString(query.error) : "<glGetError unavailable>",
+                        static_cast<unsigned int>(query.error), activeBackendPath(), trackedContextDescription(),
+                        g_probe_uniform_buffer_offset_alignment)
+        }
         break;
     }
     case GL_ARRAY_BUFFER_BINDING:
@@ -290,9 +403,11 @@ std::string getBeforeThirdSpace(const std::string& str) {
 static std::string g_probe_renderer;
 static std::string g_probe_version;
 
-static const char* activeBackendPath() {
+namespace {
+const char* activeBackendPath() {
     return g_angle_in_use ? "ANGLE" : "system GLES";
 }
+} // namespace
 
 // Return a checked copy of a backend string. A live null result is important
 // evidence that no context is current for the GLES implementation we loaded, so
@@ -375,6 +490,22 @@ void set_es_version() {
     if (version == nullptr) {
         LOG_W_FORCE("Bootstrap GLES.glGetString(GL_VERSION/0x%04x) returned nullptr; active backend path: %s",
                     static_cast<unsigned int>(GL_VERSION), activeBackendPath())
+    }
+
+    const BackendIntegerQuery alignment =
+        queryBackendInteger(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT,
+                            "bootstrap GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT probe", false);
+    if (isValidBackendInteger(alignment)) {
+        g_probe_uniform_buffer_offset_alignment = alignment.value;
+        LOG_I("Bootstrap GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: value=%d, error=GL_NO_ERROR, backend=%s",
+              g_probe_uniform_buffer_offset_alignment, activeBackendPath())
+    } else {
+        g_probe_uniform_buffer_offset_alignment = 0;
+        LOG_W_FORCE("Bootstrap GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: FAILED, value=%d, error=%s (0x%04x), backend=%s; "
+                    "no alignment fallback is available",
+                    alignment.value,
+                    alignment.error_available ? glEnumToString(alignment.error) : "<glGetError unavailable>",
+                    static_cast<unsigned int>(alignment.error), activeBackendPath())
     }
 
     std::string ESVersionStr =
