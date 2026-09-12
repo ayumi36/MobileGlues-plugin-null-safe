@@ -12,6 +12,7 @@
 #include "texture.h"
 #include <string>
 #include <format>
+#include <mutex>
 #include <vector>
 #include <random>
 #include "FSR1/FSR1.h"
@@ -282,32 +283,47 @@ std::string getBeforeThirdSpace(const std::string& str) {
     return str.substr(0, endPos);
 }
 
-static std::string safeGLESString(GLenum name, const char* fallback) {
-    const char* const enumName = glEnumToString(name);
-    const char* const backendPath = g_angle_in_use ? "ANGLE" : "system GLES";
+// What the backend said about itself while the bootstrap probe context was
+// current. These are driver properties, not properties of an individual
+// context, and remain useful if a launcher later makes a context current through
+// a different EGL entry point than the one this layer wraps.
+static std::string g_probe_renderer;
+static std::string g_probe_version;
+
+static const char* activeBackendPath() {
+    return g_angle_in_use ? "ANGLE" : "system GLES";
+}
+
+// Return a checked copy of a backend string. A live null result is important
+// evidence that no context is current for the GLES implementation we loaded, so
+// retain that evidence in the log before using the probe-time value. Only the
+// renderer/version diagnostic strings use fallbacks; extension and capability
+// discovery continue to query the backend and are not fabricated here.
+static std::string backendString(GLenum name, const std::string& probeCopy, const char* fallback,
+                                 const char* queryName) {
+    const GLubyte* live = GLES.glGetString ? GLES.glGetString(name) : nullptr;
+    if (live != nullptr) {
+        LOG_I("GLES.glGetString(%s/0x%04x) returned a valid string; active backend path: %s", queryName,
+              static_cast<unsigned int>(name), activeBackendPath())
+        return reinterpret_cast<const char*>(live);
+    }
+
+    if (!probeCopy.empty()) {
+        LOG_W_FORCE("GLES.glGetString(%s/0x%04x) returned nullptr; active backend path: %s; no context is current "
+                    "for that backend on this thread; using the bootstrap-probe value",
+                    queryName, static_cast<unsigned int>(name), activeBackendPath())
+        return probeCopy;
+    }
+
     const char* const safeFallback = fallback ? fallback : "";
-
-    if (GLES.glGetString == nullptr) {
-        LOG_W_FORCE("GLES.glGetString entry point is nullptr for %s (0x%04x); active backend path: %s; "
-                    "using fallback \"%s\"",
-                    enumName, static_cast<unsigned int>(name), backendPath, safeFallback)
-        return safeFallback;
-    }
-
-    const GLubyte* const value = GLES.glGetString(name);
-    if (value == nullptr) {
-        LOG_W_FORCE("GLES.glGetString(%s/0x%04x) returned nullptr; active backend path: %s; using fallback \"%s\"",
-                    enumName, static_cast<unsigned int>(name), backendPath, safeFallback)
-        return safeFallback;
-    }
-
-    LOG_I("GLES.glGetString(%s/0x%04x) returned a valid string; active backend path: %s", enumName,
-          static_cast<unsigned int>(name), backendPath)
-    return reinterpret_cast<const char*>(value);
+    LOG_W_FORCE("GLES.glGetString(%s/0x%04x) returned nullptr and the bootstrap probe had no value; active backend "
+                "path: %s; using diagnostic fallback",
+                queryName, static_cast<unsigned int>(name), activeBackendPath())
+    return std::string(safeFallback);
 }
 
 std::string getGpuName() {
-    std::string gpuName = safeGLESString(GL_RENDERER, "<unknown>");
+    std::string gpuName = backendString(GL_RENDERER, g_probe_renderer, "<unknown>", "GL_RENDERER");
 
     if (gpuName.empty()) {
         return "<unknown>";
@@ -345,7 +361,24 @@ std::string getGpuName() {
 }
 
 void set_es_version() {
-    std::string ESVersionStr = getBeforeThirdSpace(safeGLESString(GL_VERSION, "OpenGL ES 3.0"));
+    // init_target_egl keeps its bootstrap context current until native setup is
+    // complete. Copy both strings now so the exported glGetString wrapper never
+    // has to feed a later null backend result to std::string/strlen.
+    const GLubyte* renderer = GLES.glGetString ? GLES.glGetString(GL_RENDERER) : nullptr;
+    const GLubyte* version = GLES.glGetString ? GLES.glGetString(GL_VERSION) : nullptr;
+    g_probe_renderer = renderer ? reinterpret_cast<const char*>(renderer) : "";
+    g_probe_version = version ? reinterpret_cast<const char*>(version) : "";
+    if (renderer == nullptr) {
+        LOG_W_FORCE("Bootstrap GLES.glGetString(GL_RENDERER/0x%04x) returned nullptr; active backend path: %s",
+                    static_cast<unsigned int>(GL_RENDERER), activeBackendPath())
+    }
+    if (version == nullptr) {
+        LOG_W_FORCE("Bootstrap GLES.glGetString(GL_VERSION/0x%04x) returned nullptr; active backend path: %s",
+                    static_cast<unsigned int>(GL_VERSION), activeBackendPath())
+    }
+
+    std::string ESVersionStr =
+        getBeforeThirdSpace(g_probe_version.empty() ? std::string("OpenGL ES 3.0") : g_probe_version);
     int major, minor;
 
     if (sscanf(ESVersionStr.c_str(), "OpenGL ES %d.%d", &major, &minor) == 2) {
@@ -360,15 +393,38 @@ void set_es_version() {
 }
 
 std::string getGLESName() {
-    return getBeforeThirdSpace(safeGLESString(GL_VERSION, "OpenGL ES 3.0"));
+    return getBeforeThirdSpace(backendString(GL_VERSION, g_probe_version, "OpenGL ES 3.0", "GL_VERSION"));
 }
 
 static std::string rendererString;
 static std::string vendorString;
 static std::string versionString;
+static const GLubyte emptyString[] = "";
+static std::mutex stringCacheMutex;
+
+// The GL_MG backend getter enums are string APIs too. They deliberately bypass
+// MobileGlues' synthetic desktop strings, but a null backend result must still
+// not escape to a caller that will immediately measure it with strlen. An empty
+// string reports "unavailable" without inventing an extension, vendor, or
+// capability. Renderer/version may use the real values captured by the probe.
+static const GLubyte* checkedBackendStringPointer(GLenum name, const char* queryName, const GLubyte* fallback) {
+    const GLubyte* value = GLES.glGetString ? GLES.glGetString(name) : nullptr;
+    if (value != nullptr) return value;
+
+    LOG_W_FORCE("GLES.glGetString(%s/0x%04x) returned nullptr in exported glGetString; active backend path: %s; "
+                "returning a non-null unavailable/probe string",
+                queryName, static_cast<unsigned int>(name), activeBackendPath())
+    return fallback ? fallback : emptyString;
+}
+
 const GLubyte* glGetString(GLenum name) {
     LOG()
     LOG_D("glGetString, %s", glEnumToString(name))
+    // The cached strings below are process-wide and are returned by pointer.
+    // Serialize their first construction so simultaneous LWJGL/render-thread
+    // queries cannot race a std::string assignment or observe a half-written
+    // representation.
+    std::lock_guard<std::mutex> cacheLock(stringCacheMutex);
     switch (name) {
     case GL_VENDOR: {
         if (vendorString.empty()) {
@@ -520,23 +576,53 @@ const GLubyte* glGetString(GLenum name) {
         return (const GLubyte*)extensionsString.c_str();
     }
     case GL_SETTINGS_MG: {
-        if (global_settings.hide_mg_env_level >= HideMGEnvLevel::Level1) return GLES.glGetString(name);
+        if (global_settings.hide_mg_env_level >= HideMGEnvLevel::Level1) return emptyString;
 
         static char* settings_string = nullptr;
         std::string tmp = dump_settings_string("  ");
-        settings_string = strdup(tmp.c_str());
+        char* replacement = strdup(tmp.c_str());
+        if (replacement == nullptr) {
+            LOG_W_FORCE("glGetString(GL_SETTINGS_MG): strdup failed; returning a non-null empty string")
+            return emptyString;
+        }
+        settings_string = replacement;
         return reinterpret_cast<const GLubyte*>(settings_string);
     }
     case GL_VERSION + GL_BACKEND_GETTER_MG:
     case GL_VENDOR + GL_BACKEND_GETTER_MG:
     case GL_RENDERER + GL_BACKEND_GETTER_MG:
     case GL_EXTENSIONS + GL_BACKEND_GETTER_MG:
-    case GL_SHADING_LANGUAGE_VERSION + GL_BACKEND_GETTER_MG:
-        if (global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled)
-            return GLES.glGetString(name - GL_BACKEND_GETTER_MG);
-        else
-            return GLES.glGetString(name);
+    case GL_SHADING_LANGUAGE_VERSION + GL_BACKEND_GETTER_MG: {
+        if (global_settings.hide_mg_env_level != HideMGEnvLevel::Disabled) return emptyString;
+
+        const GLenum backendName = name - GL_BACKEND_GETTER_MG;
+        const GLubyte* fallback = emptyString;
+        const char* queryName = "backend string";
+        if (backendName == GL_RENDERER) {
+            queryName = "GL_RENDERER";
+            if (!g_probe_renderer.empty()) fallback = reinterpret_cast<const GLubyte*>(g_probe_renderer.c_str());
+        } else if (backendName == GL_VERSION) {
+            queryName = "GL_VERSION";
+            if (!g_probe_version.empty()) fallback = reinterpret_cast<const GLubyte*>(g_probe_version.c_str());
+        } else if (backendName == GL_VENDOR) {
+            queryName = "GL_VENDOR";
+        } else if (backendName == GL_EXTENSIONS) {
+            queryName = "GL_EXTENSIONS";
+        } else if (backendName == GL_SHADING_LANGUAGE_VERSION) {
+            queryName = "GL_SHADING_LANGUAGE_VERSION";
+        }
+        return checkedBackendStringPointer(backendName, queryName, fallback);
+    }
     default:
+        // Preserve OpenGL's validation semantics for invalid/unsupported names:
+        // they may return null. Every standard string enum and every MobileGlues
+        // string enum is handled above, so this path is not renderer/version
+        // initialization and must not manufacture a capability-bearing value.
+        if (GLES.glGetString == nullptr) {
+            LOG_W_FORCE("GLES.glGetString entry point is nullptr for unhandled enum 0x%04x; active backend path: %s",
+                        static_cast<unsigned int>(name), activeBackendPath())
+            return nullptr;
+        }
         return GLES.glGetString(name);
     }
 }

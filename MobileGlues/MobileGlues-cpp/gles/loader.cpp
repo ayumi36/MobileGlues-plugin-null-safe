@@ -137,11 +137,33 @@ void load_libs() {
     // of the two it got. Probing the loaded image for an ANGLE symbol would not
     // answer it either: a device whose system driver *is* ANGLE would say yes.
     // Only the loader knows, so it reports.
-    g_angle_in_use = false;
-    gles = open_lib(gles3_lib, gles_override, &g_angle_in_use);
-    egl = open_lib(egl_lib, egl_override, nullptr);
+    bool gles_from_angle = false;
+    bool egl_from_angle = false;
+    gles = open_lib(gles3_lib, gles_override, &gles_from_angle);
+    egl = open_lib(egl_lib, egl_override, &egl_from_angle);
+    if (gles_from_angle != egl_from_angle) {
+        // Loading ANGLE for only one half gives EGL contexts to one
+        // implementation while every GLES call reaches the other. That other
+        // implementation has no current context, so even GL_RENDERER returns
+        // nullptr. Keep the pair coherent and expose the fallback in release
+        // logs instead of allowing a later string conversion to crash.
+        LOG_W_FORCE("ANGLE loaded only its %s half; using the system GLES and EGL libraries as a matched pair",
+                    gles_from_angle ? "GLES" : "EGL")
+        if (gles_from_angle) {
+            dlclose(gles);
+            gles = open_lib(gles3_lib, nullptr, nullptr);
+        } else {
+            dlclose(egl);
+            egl = open_lib(egl_lib, nullptr, nullptr);
+        }
+        gles_from_angle = false;
+        egl_from_angle = false;
+    }
+    g_angle_in_use = gles_from_angle;
     if (want_angle && !g_angle_in_use) {
-        LOG_E("ANGLE was requested but was not loaded; running on the system driver\n")
+        LOG_W_FORCE("ANGLE was requested but was not loaded as a matched GLES/EGL pair; running on the system driver")
+    } else {
+        LOG_I("MobileGlues active backend path: %s", g_angle_in_use ? "ANGLE" : "system GLES/EGL")
     }
 #else
     gles = (void*)(~(uintptr_t)0);
